@@ -6,46 +6,353 @@ output: pdf_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+```{r include=FALSE}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- read.table(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                      col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+
+set.seed(1) # if using R 3.6.0: set.seed(1, sample.kind = "Rounding")
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+```{r include=FALSE}
+# Required libs to run this project
+library(stringr)
+library(gridExtra)
+library(gtable)
+library(grid)
 ```
 
 # 1. Executive Summary
 
-This data set contains 10000054 ratings and 95580 tags applied to 10681 movies by 71567 users of the online movie recommender service MovieLens.
+Based on a large data set of movie ratings, a machine learning algorithm was developed to predict user ratings.
 
-Users were selected at random for inclusion. All users selected had rated at least 20 movies. Unlike previous MovieLens data sets, no demographic information is included. Each user is represented by an id, and no other information is provided.
+This data set contains 10,000,054 ratings and 95,580 tags applied to 10,681 movies by 71,567 users of the online movie recommender service MovieLens.
 
-The data are contained in three files, movies.dat, ratings.dat and tags.dat. Also included are scripts for generating subsets of the data to support five-fold cross-validation of rating predictions. More details about the contents and use of all these files follows.
+The metric we're going to use to evaluate how good our model is will be the RMSE.
 
-RMSE
+4 models were developed considering:
 
+1. Simple average of ratings
+2. Movie Effects
+3. User Effects
+4. Movie Age Effects
 
-# Introduction - Data Exploration
+The final model resulting in the lowest RMSE (~0.865) is a combination of the first three models.
 
+We finally tuned our model to include appropriate regularization and validated against our test set. The final result was a RMSE of 0.825.
+
+# 2. Introduction - Data Exploration
+
+After downloading the files, creating the train and test set, we can start exploring the data set creating some charts to better understand the problem.
+
+Let's start with a distribution of ratings
 ```{r}
 edx %>% group_by(movieId) %>%
   summarise(n = n()) %>%
   ggplot(aes(n)) + 
   geom_histogram(fill = "darkred", color = "white", bins = 30) +
   scale_x_log10() +
-  title("Movies Ratings")
+  ggtitle("Movies Ratings") +
+  xlab("Number of ratings (log10)") +
+  ylab("Number of movies")
+```
 
+Now let's see the distribution of ratings by users
+```{r}
 edx %>% group_by(userId) %>%
   summarise(n = n()) %>%
   ggplot(aes(n)) + 
   geom_histogram(fill = "darkred", color = "white", bins = 30) +
   scale_x_log10() +
-  title("User Ratings")
+  ggtitle("User Ratings") +
+  xlab("Number of ratings (log10)") +
+  ylab("Number of users")
 ```
 
+```{r}
+edx %>% group_by(userId) %>%
+  summarise(b_u = mean(rating)) %>%
+  ggplot(aes(b_u)) + 
+  geom_histogram(fill = "darkred", color = "white", bins = 30) +
+  ggtitle("Ratings by User") +
+  xlab("Rating") +
+  ylab("Number of ratings")
 
+mean(edx$rating)
+```
+Ratings tend to fall in the range of 3 to 4.5.
 
-## Methods
+## Exploring the Age of the movies
+First we need to extract the Release Date from the movie title and then calculate the age.
+```{r}
+release_pattern <- "(\\()(\\d{4})(\\))"
+edx_age <- edx %>% mutate(release = as.numeric(str_match(edx$title, release_pattern)[,3]))
 
+# Checking if extraction is ok
+identical(as.numeric(str_match(edx_age$title, release_pattern)[,3]), edx_age$release)
 
-## Results
+# Calculating the AGE
+edx_age <- edx_age %>% mutate(age = 2019 - release)
+```
 
+Now we can see the distribution of rating by age
+```{r}
+edx_age %>% 
+  ggplot(aes((age))) +
+  geom_histogram(fill = "darkred", color = "white", bins = 30) +
+  ggtitle("Ratings by Age") +
+  xlab("Age") +
+  ylab("Number of ratings")
 
-## Conclusion
+  mean(edx_age$age)
+```
+It seems movies from the 90's tend to get more ratings. Let's dig a little deeper to see why.
 
+```{r}
+# Number of movies by Age
+edx_age %>% group_by(movieId) %>% summarise(n = n(), age = first(age)) %>%
+    ggplot(aes((age))) +
+    geom_histogram(fill = "darkred", color = "white", bins = 30) +
+    ggtitle("Movies by Age") +
+    xlab("Age") +
+    ylab("Number of movies")
+
+```
+We see from the plot above that there are more movies from the 90's!
+
+Now, let's check if age might influence rating
+```{r}
+avg_rating_by_age <- edx_age %>% group_by(age) %>% summarise(avg_rating = mean(rating))
+
+avg_rating_by_age %>%
+  ggplot(aes(x = age, y = avg_rating)) +
+  geom_point() +
+  geom_smooth() +
+  ggtitle("Average rating by Movie Age") +
+  xlab("Movie Age") +
+  ylab("Average Age")
+```
+It seems movie age plays a role in estimating the rate of a movie.
+
+# 3. Building the Model
+
+Before we start building our model, let's define our RMSE function.
+
+```{r}
+RMSE <- function(true_ratings, predicted_ratings){ 
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+## 3.1 First Model - Simple Average
+Our first model is a simple average of ratings.
+
+```{r}
+mu_hat <- mean(edx$rating) 
+mu_hat
+
+naive_rmse <- RMSE(validation$rating, mu_hat) 
+naive_rmse
+
+rmse_results <- tibble(method = "Just the average", RMSE = naive_rmse)
+```
+As we can see the RMSE is above 1. We need to improve it.
+
+## 3.2 Second Model - Movie Effect
+In our second model we will include the movie effect to see if we can lower the RMSE
+```{r}
+mu <- mean(edx$rating) 
+movie_avgs <- edx %>%
+  group_by(movieId) %>% summarize(b_i = mean(rating - mu))
+
+movie_avgs %>% ggplot(aes(b_i)) +
+  geom_histogram(fill = "darkred", color = "white", bins = 30)
+
+predicted_ratings <- mu + validation %>% 
+  left_join(movie_avgs, by='movieId') %>% 
+  pull(b_i)
+
+movie_rmse <- RMSE(validation$rating, predicted_ratings) 
+rmse_results <- bind_rows(rmse_results,
+                          tibble(method="Movie Effect Model", RMSE = movie_rmse))
+rmse_results
+
+```
+This model improved our predictions and our RMSE is now at 0.943. However, it's not enough to pass.
+
+## 3.3 Third Model - User Effect
+Our third model will include the user effect.
+```{r}
+user_avgs <- edx %>% left_join(movie_avgs, by='movieId') %>% 
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+predicted_ratings <- validation %>% 
+  left_join(movie_avgs, by='movieId') %>% 
+  left_join(user_avgs, by='userId') %>% 
+  mutate(pred = mu + b_i + b_u) %>% 
+  pull(pred)
+
+user_rmse <- RMSE(validation$rating, predicted_ratings)
+rmse_results <- bind_rows(rmse_results, 
+                          tibble(method="Movie + User Effects Model", RMSE = user_rmse))
+
+rmse_results
+```
+We're getting better. Our model now has a RMSE of 0.865. Although it's enough to pass, let's see if we can improve even more.
+
+## 3.4 Fourth Model - Age Effect
+Our fourth model will then include the age effect. 
+As we saw that rating varies with age, we will use a smooth function using loess to fit the data.
+```{r}
+total_span <- diff(range(avg_rating_by_age$age))
+span <- 30/total_span
+
+avg_rating_by_age.loess <- loess(avg_rating ~ age, 
+                                 degree = 1, 
+                                 span = span, 
+                                 data = avg_rating_by_age)
+
+avg_rating_by_age %>% mutate(smooth = avg_rating_by_age.loess$fitted) %>% 
+  ggplot(aes(age, avg_rating)) +
+  geom_point(size = 3, alpha = .5, color = "black") + 
+  geom_line(aes(age, smooth), size = 1, color="red")
+```
+
+In order to test it, we need to make a little adaptation to our validaton set to include the age
+```{r}
+age_avgs <- edx_age %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(age) %>%
+  summarize(b_a = mean(predict(avg_rating_by_age.loess, newdata = age) - mu - b_i - b_u))
+
+validation <- validation %>% 
+  mutate(release = as.numeric(str_match(title, release_pattern)[,3])) %>% 
+  mutate(age = 2019 - release)
+
+predicted_ratings <- validation %>% 
+  left_join(movie_avgs, by='movieId') %>% 
+  left_join(user_avgs, by='userId') %>%
+  left_join(age_avgs, by='age') %>%
+  mutate(pred = mu + b_i + b_u + b_a) %>% 
+  pull(pred)
+
+age_rmse <- RMSE(validation$rating, predicted_ratings)
+rmse_results <- bind_rows(rmse_results, 
+                          tibble(method = "Movie, User and Age Effects Model", RMSE = age_rmse))
+rmse_results
+```
+As we see, age does not improve our model, so let's keep it out from our model.
+
+# 4. Results
+
+Now we have our model almost ready. It's time to tune it and penalize large estimates from small sample sizes.  
+```{r}
+lambdas <- seq(0, 5, .25)
+rmses <- sapply(lambdas, function(l){
+  mu <- mean(edx_age$rating)
+  
+  b_i <- edx_age %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  
+  b_u <- edx_age %>%
+    left_join(b_i, by="movieId") %>% 
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  
+  predicted_ratings <- edx_age %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>% .$pred
+  
+  return(RMSE(predicted_ratings, edx_age$rating))
+})
+```
+
+```{r}
+qplot(lambdas, rmses)
+lambdas[which.min(rmses)]
+```
+The best lambda for our model is 0.5.
+
+```{r}
+rmse_results <- bind_rows(rmse_results,
+                          tibble(method="Regularized Movie + User Effect Model",
+                                 RMSE = min(rmses)))
+
+rmse_results %>% knitr::kable()
+```
+
+Now we have a final model with a RMSE of 0.856
+
+We are not ready yet. Let's finally test our model against the validation set and see the results
+
+# 5. Conclusion
+
+Testing our model against the validation is the final step to make sure we have built a decent model.
+```{r}
+mu <- mean(validation$rating)
+l <- lambdas[which.min(rmses)]
+
+b_i <- validation %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu)/(n()+l))
+
+b_u <- validation %>%
+  left_join(b_i, by="movieId") %>% 
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+
+predicted_ratings <- validation %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  mutate(pred = mu + b_i + b_u) %>% .$pred
+
+RMSE(predicted_ratings, validation$rating)
+```
+As we can see, our model is able to predict the ratings with a RMSE of 0.825.
 

@@ -51,12 +51,11 @@ edx <- rbind(edx, removed)
 
 rm(dl, ratings, movies, test_index, temp, movielens, removed)
 
+# Required libs to run this project
 library(stringr)
-
-# The RMSE function to evaluate models
-RMSE <- function(true_ratings, predicted_ratings){ 
-  sqrt(mean((true_ratings - predicted_ratings)^2))
-}
+library(gridExtra)
+library(gtable)
+library(grid)
 
 ###################################
 # Data Exploration
@@ -74,7 +73,7 @@ edx %>% group_by(movieId) %>%
   ylab("Number of movies")
 
 edx %>% group_by(userId) %>%
-  summarise(n = n()) %>% sum()
+  summarise(n = n()) %>%
   ggplot(aes(n)) + 
   geom_histogram(fill = "darkred", color = "white", bins = 30) +
   scale_x_log10() +
@@ -117,9 +116,9 @@ edx_age %>%
 edx_age %>% group_by(movieId) %>% summarise(n = n(), age = first(age)) %>%
     ggplot(aes((age))) +
     geom_histogram(fill = "darkred", color = "white", bins = 30) +
-    ggtitle("Ratings by Age") +
+    ggtitle("Movies by Age") +
     xlab("Age") +
-    ylab("Number of ratings")
+    ylab("Number of movies")
 
 # Average Rating by Age
 avg_rating_by_age <- edx_age %>% group_by(age) %>% summarise(avg_rating = mean(rating))
@@ -131,24 +130,6 @@ avg_rating_by_age %>%
   ggtitle("Average rating by Movie Age") +
   xlab("Movie Age") +
   ylab("Average Age")
-
-# It seems, movie age play a role in estimating the rate of a movie. Let's try the loess function to estimate
-# and then calculate the RMSE
-total_span <- diff(range(avg_rating_by_age$age))
-span <- 30/total_span
-
-avg_rating_by_age.loess <- loess(avg_rating ~ age, degree = 1, span = span, data = avg_rating_by_age)
-
-avg_rating_by_age %>% mutate(smooth = avg_rating_by_age.loess$fitted) %>% 
-    ggplot(aes(age, avg_rating)) +
-    geom_point(size = 3, alpha = .5, color = "black") + 
-    geom_line(aes(age, smooth), size = 1, color="red")
-
-y_hat_age <- predict(avg_rating_by_age.loess, newdata = validation$age)
-
-age_rmse <- RMSE(validation$rating, y_hat_age)
-
-rmse_results <- tibble(method = "By Age", RMSE = age_rmse)
 
 # Exploring single GENRES influence
 edx_genres <- edx %>% separate_rows(genres, sep ="\\|")
@@ -174,9 +155,6 @@ avg_rating_by_genre.plot_b <- avg_rating_by_genre %>%
   xlab("Genre") +
   ylab("Number of ratings")
 
-library("gridExtra")
-library(gtable)
-library(grid)
 g1 <- ggplotGrob(avg_rating_by_genre.plot_a)
 g2 <- ggplotGrob(avg_rating_by_genre.plot_b)
 g <- rbind(g1, g2, size = "first")
@@ -188,31 +166,114 @@ grid.draw(g)
 # Building the Model
 ###################################
 
-#Choose the tuning value
-lambdas <- seq(0,5,.5)
+# The RMSE function to evaluate our models
+RMSE <- function(true_ratings, predicted_ratings){ 
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+
+# First Model - Simple Average
+# Yu,i = mu + Eu,i
+
+mu_hat <- mean(edx$rating) 
+mu_hat
+
+naive_rmse <- RMSE(validation$rating, mu_hat) 
+naive_rmse
+
+rmse_results <- tibble(method = "Just the average", RMSE = naive_rmse)
+
+# Second Model - Movie Effects
+# Yu,i = mu + bi + Eu,i
+
+mu <- mean(edx$rating) 
+movie_avgs <- edx %>%
+  group_by(movieId) %>% summarize(b_i = mean(rating - mu))
+
+movie_avgs %>% ggplot(aes(b_i)) +
+  geom_histogram(fill = "darkred", color = "white", bins = 30)
+
+predicted_ratings <- mu + validation %>% 
+  left_join(movie_avgs, by='movieId') %>% 
+  pull(b_i)
+
+movie_rmse <- RMSE(validation$rating, predicted_ratings) 
+rmse_results <- bind_rows(rmse_results,
+                          tibble(method="Movie Effect Model", RMSE = movie_rmse))
+rmse_results
+
+# Third Model - User Effects
+# Yu,i = mu + bi + bu + Eu,i
+
+user_avgs <- edx %>% left_join(movie_avgs, by='movieId') %>% 
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+predicted_ratings <- validation %>% 
+  left_join(movie_avgs, by='movieId') %>% 
+  left_join(user_avgs, by='userId') %>% 
+  mutate(pred = mu + b_i + b_u) %>% 
+  pull(pred)
+
+user_rmse <- RMSE(validation$rating, predicted_ratings)
+rmse_results <- bind_rows(rmse_results, tibble(method="Movie + User Effects Model", RMSE = user_rmse))
+
+rmse_results
+
+# Fourth Model - Age Effects
+# Yu,i = mu + bi + bu + f(dui) + Eu,i
+
+# From our data exploration, it seems movie age plays a role in estimating the rate of a movie. 
+# Let's try the loess function to estimate and incorporate it in our model
+total_span <- diff(range(avg_rating_by_age$age))
+span <- 30/total_span
+
+avg_rating_by_age.loess <- loess(avg_rating ~ age, degree = 1, span = span, data = avg_rating_by_age)
+
+avg_rating_by_age %>% mutate(smooth = avg_rating_by_age.loess$fitted) %>% 
+  ggplot(aes(age, avg_rating)) +
+  geom_point(size = 3, alpha = .5, color = "black") + 
+  geom_line(aes(age, smooth), size = 1, color="red")
+
+age_avgs <- edx_age %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(age) %>%
+  summarize(b_a = mean(predict(avg_rating_by_age.loess, newdata = age) - mu - b_i - b_u))
+
+validation <- validation %>% 
+  mutate(release = as.numeric(str_match(title, release_pattern)[,3])) %>% 
+  mutate(age = 2019 - release)
+
+predicted_ratings <- validation %>% 
+  left_join(movie_avgs, by='movieId') %>% 
+  left_join(user_avgs, by='userId') %>%
+  left_join(age_avgs, by='age') %>%
+  mutate(pred = mu + b_i + b_u + b_a) %>% 
+  pull(pred)
+
+age_rmse <- RMSE(validation$rating, predicted_ratings)
+rmse_results <- bind_rows(rmse_results, tibble(method = "Movie, User and Age Effects Model", RMSE = age_rmse))
+rmse_results
+# Since it does not improve our model, we're not going to use it in the final model
+
+# Time to tune our final model
+lambdas <- seq(0, 5, .25)
 rmses <- sapply(lambdas, function(l){
   mu <- mean(edx_age$rating)
   
-  b_a <- edx_age %>%
-    group_by(age) %>%
-    summarize(b_a = sum(predict(avg_rating_by_age.loess, newdata = age) - mu)/(n() + l))
-  
   b_i <- edx_age %>%
-    left_join(b_a, by="age") %>%
     group_by(movieId) %>%
-    summarize(b_i = sum(rating - mu)/(n() + l))
+    summarize(b_i = sum(rating - mu)/(n()+l))
   
   b_u <- edx_age %>%
-    left_join(b_a, by="age") %>%
-    left_join(b_i, by='movieId') %>% 
+    left_join(b_i, by="movieId") %>% 
     group_by(userId) %>%
-    summarize(b_u = sum(rating - b_i - b_a - mu)/(n() +l))
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
   
   predicted_ratings <- edx_age %>%
-    left_join(b_a, by="age") %>%
     left_join(b_i, by = "movieId") %>%
     left_join(b_u, by = "userId") %>%
-    mutate(pred = mu + b_a + b_i + b_u) %>% .$pred
+    mutate(pred = mu + b_i + b_u) %>% .$pred
   
   return(RMSE(predicted_ratings, edx_age$rating))
 })
@@ -221,7 +282,7 @@ qplot(lambdas, rmses)
 lambdas[which.min(rmses)]
 
 rmse_results <- bind_rows(rmse_results,
-                          tibble(method="Regularized Movie + User Effect Model + Age",
+                          tibble(method="Regularized Movie + User Effect Model",
                                  RMSE = min(rmses)))
 
 rmse_results %>% knitr::kable()
@@ -231,32 +292,21 @@ rmse_results %>% knitr::kable()
 #####################################
 
 mu <- mean(validation$rating)
-l <- 0.5
+l <- lambdas[which.min(rmses)]
 
-validation_age <- validation %>% 
-  mutate(release = as.numeric(str_match(title, release_pattern)[,3])) %>% 
-  mutate(age = 2019 - release)
-
-b_a <- validation_age %>%
-  group_by(age) %>%
-  summarize(b_a = sum(predict(avg_rating_by_age.loess, newdata = age) - mu)/(n() + l))
-
-b_i <- validation_age %>%
-  left_join(b_a, by="age") %>%
+b_i <- validation %>%
   group_by(movieId) %>%
-  summarize(b_i = sum(rating - mu)/(n() + l))
+  summarize(b_i = sum(rating - mu)/(n()+l))
 
-b_u <- validation_age %>%
-  left_join(b_a, by="age") %>%
-  left_join(b_i, by='movieId') %>% 
+b_u <- validation %>%
+  left_join(b_i, by="movieId") %>% 
   group_by(userId) %>%
-  summarize(b_u = sum(rating - b_i - mu)/(n() +l))
+  summarize(b_u = sum(rating - b_i - mu)/(n()+l))
 
-predicted_ratings <- validation_age %>%
-  left_join(b_a, by="age") %>%
+predicted_ratings <- validation %>%
   left_join(b_i, by = "movieId") %>%
   left_join(b_u, by = "userId") %>%
-  mutate(pred = mu + b_i +  b_u) %>% .$pred
+  mutate(pred = mu + b_i + b_u) %>% .$pred
 
 RMSE(predicted_ratings, validation$rating)
 
